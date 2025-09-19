@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Location Tracker</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <!-- Leaflet CSS & JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        #map { height: 70vh; width: 100%; }
+        .controls {
+            padding: 10px;
+            background: #f0f0f0;
+            border-bottom: 1px solid #ccc;
+        }
+        .info {
+            padding: 10px;
+            background: white;
+            font-size: 14px;
+        }
+        .info div { margin: 5px 0; }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        button:hover:not(:disabled) {
+            background: #45a049;
+        }
+        .status { font-weight: bold; color: #333; }
+        .coords { color: #666; }
+        .accuracy.good { color: #4CAF50; }
+        .accuracy.fair { color: #FF9800; }
+        .accuracy.poor { color: #F44336; }
+        .movement { font-style: italic; color: #2196F3; }
+        .distance { color: #9C27B0; }
+    </style>
+</head>
+<body>
+<div class="controls">
+    <button id="btnCurrent" onclick="getCurrentLocation()">📍 Get Current Location</button>
+    <button id="btnStart" onclick="startLocationTracking()">▶️ Start Tracking</button>
+    <button id="btnStop" onclick="stopLocationTracking()" disabled>⏸️ Stop Tracking</button>
+    <button id="btnReset" onclick="resetTracking()">🔄 Reset</button>
+</div>
+
+<div id="map"></div>
+
+<div class="info">
+    <div id="status" class="status">Status: Ready to track</div>
+    <div id="coords" class="coords">Coordinates: Not available</div>
+    <div id="accuracy">GPS Accuracy: -- meters</div>
+    <div id="movement" class="movement">Movement State: Idle</div>
+    <div id="distance" class="distance">Total Distance: 0.0 meters</div>
+    <div id="count">Confirmed Movements: 0</div>
+</div>
+
+<script>
+    // Configuration constants
+    const MINIMUM_MOVEMENT_METERS = 3.0;
+    const MAXIMUM_ACCURACY_METERS = 15.0;
+    const GPS_DRIFT_RADIUS = 8.0;
+    const MOVEMENT_CONFIRMATION_COUNT = 3;
+    const STATIONARY_TIME_THRESHOLD = 30000;
+    const SMOOTHING_FACTOR = 0.3;
+
+    // State variables
+    let map, currentLocationMarker, pathPolyline;
+    let watchId = null;
+    let isTracking = false;
+    let referenceLocation = null;
+    let smoothedLocation = null;
+    let locationPath = [];
+    let movementBuffer = [];
+    let stationaryStartTime = Date.now();
+    let isCurrentlyStationary = true;
+    let validMovementCount = 0;
+    let totalDistance = 0;
+
+    // UI elements
+    const statusEl = document.getElementById('status');
+    const coordsEl = document.getElementById('coords');
+    const accuracyEl = document.getElementById('accuracy');
+    const movementEl = document.getElementById('movement');
+    const distanceEl = document.getElementById('distance');
+    const countEl = document.getElementById('count');
+
+    // Initialize Leaflet map
+    function initializeMap() {
+        map = L.map('map').setView([11.3056, 76.9350], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors',
+            maxZoom: 19
+        }).addTo(map);
+
+        currentLocationMarker = L.marker([11.3056, 76.9350]).addTo(map);
+        pathPolyline = L.polyline([], { color: '#00FF00', weight: 4, opacity: 0.8 }).addTo(map);
+    }
+
+    // Exponential smoothing
+    function applySmoothingFilter(newLoc) {
+        if (!smoothedLocation) {
+            smoothedLocation = { ...newLoc };
+            return smoothedLocation;
+        }
+        smoothedLocation.latitude += SMOOTHING_FACTOR * (newLoc.latitude - smoothedLocation.latitude);
+        smoothedLocation.longitude += SMOOTHING_FACTOR * (newLoc.longitude - smoothedLocation.longitude);
+        smoothedLocation.accuracy = newLoc.accuracy;
+        return { ...smoothedLocation };
+    }
+
+    // Haversine distance
+    function calculateDistance(lat1, lon1, lat2, lon2) {
+        const R = 6371e3;
+        const φ1 = lat1 * Math.PI/180, φ2 = lat2 * Math.PI/180;
+        const Δφ = (lat2-lat1)*Math.PI/180, Δλ = (lon2-lon1)*Math.PI/180;
+        const a = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    // Analyze motion vs stationary
+    function analyzeMovementState(loc) {
+        const now = Date.now();
+        if (!referenceLocation) {
+            referenceLocation = { ...loc };
+            stationaryStartTime = now;
+            isCurrentlyStationary = true;
+            updateMovementStateDisplay('Establishing reference position');
+            return;
+        }
+        const dist = calculateDistance(
+            referenceLocation.latitude, referenceLocation.longitude,
+            loc.latitude, loc.longitude
+        );
+        if (dist <= GPS_DRIFT_RADIUS) {
+            if (!isCurrentlyStationary) {
+                stationaryStartTime = now;
+                isCurrentlyStationary = true;
+                movementBuffer = [];
+            }
+            if (now - stationaryStartTime > STATIONARY_TIME_THRESHOLD) {
+                updateMovementStateDisplay(`Confirmed STATIONARY (drift ${dist.toFixed(1)}m)`);
+                updateStatus('Device is stationary - no movement detected');
+            } else {
+                updateMovementStateDisplay('Analyzing position stability...');
+            }
+        } else {
+            if (isCurrentlyStationary) isCurrentlyStationary = false;
+            movementBuffer.push({ ...loc });
+            if (movementBuffer.length > MOVEMENT_CONFIRMATION_COUNT + 2) movementBuffer.shift();
+            updateMovementStateDisplay(`Potential movement (${dist.toFixed(1)}m)`);
+        }
+    }
+
+    // Confirm movement
+    function isConfirmedMovement(loc) {
+        if (!referenceLocation || movementBuffer.length < MOVEMENT_CONFIRMATION_COUNT) return false;
+        const valid = movementBuffer.filter(p =>
+            calculateDistance(referenceLocation.latitude, referenceLocation.longitude, p.latitude, p.longitude) > GPS_DRIFT_RADIUS
+        ).length;
+        if (valid < MOVEMENT_CONFIRMATION_COUNT) return false;
+        return calculateDistance(
+            referenceLocation.latitude, referenceLocation.longitude,
+            loc.latitude, loc.longitude
+        ) >= MINIMUM_MOVEMENT_METERS;
+    }
+
+    // Handle confirmed movement
+    function handleConfirmedMovement(loc) {
+        const ll = [loc.latitude, loc.longitude];
+        const moved = calculateDistance(
+            referenceLocation.latitude, referenceLocation.longitude,
+            loc.latitude, loc.longitude
+        );
+        validMovementCount++;
+        totalDistance += moved;
+        referenceLocation = { ...loc };
+        movementBuffer = [];
+        stationaryStartTime = Date.now();
+        isCurrentlyStationary = true;
+        updateDistanceDisplay();
+        showNotification(`🎯 CONFIRMED: Moved ${moved.toFixed(1)}m`);
+        locationPath.push(ll);
+        pathPolyline.setLatLngs(locationPath);
+        updateMapMarker(ll);
+        updateMovementStateDisplay('✓ CONFIRMED MOVEMENT');
+    }
+
+    // Update marker
+    function updateMapMarker(ll) {
+        currentLocationMarker.setLatLng(ll).openPopup();
+        map.setView(ll, 18);
+    }
+
+    // UI updates
+    function updateStatus(txt) { statusEl.textContent = `Status: ${txt}`; }
+    function updateCoordinatesDisplay(loc) {
+        coordsEl.textContent = `Coordinates: ${loc.latitude.toFixed(6)}, ${loc.longitude.toFixed(6)}`;
+    }
+    function updateAccuracyDisplay(loc) {
+        accuracyEl.textContent = `GPS Accuracy: ${loc.accuracy.toFixed(1)}m`;
+        accuracyEl.className = loc.accuracy <= 5 ? 'accuracy good'
+            : loc.accuracy <=10 ? 'accuracy fair' : 'accuracy poor';
+    }
+    function updateMovementStateDisplay(txt) { movementEl.textContent = `Movement State: ${txt}`; }
+    function updateDistanceDisplay() {
+        distanceEl.textContent = `Total Distance: ${totalDistance.toFixed(1)} meters`;
+        countEl.textContent = `Confirmed Movements: ${validMovementCount}`;
+    }
+    function showNotification(msg) { alert(msg); }
+
+    // Get Current Location
+    function getCurrentLocation() {
+        console.log('▶ getCurrentLocation()');
+        if (!navigator.geolocation) {
+            updateStatus('Geolocation not supported');
+            return;
+        }
+        updateStatus('Getting accurate location...');
+        navigator.geolocation.getCurrentPosition(
+            pos => { console.log('✔ getCurrent success'); displayCurrentLocation(pos); },
+            err => { console.error('✖ getCurrent error', err); updateStatus('Error: '+err.message); },
+            { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+        );
+    }
+
+    // Display current
+    function displayCurrentLocation(position) {
+        console.log('✔ displayCurrentLocation', position);
+        const loc = {
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            accuracy: position.coords.accuracy
+        };
+        updateCoordinatesDisplay(loc);
+        updateAccuracyDisplay(loc);
+        updateMapMarker([loc.latitude, loc.longitude]);
+        referenceLocation = { ...loc };
+        smoothedLocation = { ...loc };
+        locationPath = [[loc.latitude, loc.longitude]];
+        pathPolyline.setLatLngs(locationPath);
+        validMovementCount = 0; totalDistance = 0;
+        updateDistanceDisplay();
+        updateStatus('Reference location set!');
+        updateMovementStateDisplay('Reference established');
+    }
+
+    // Start tracking
+    function startLocationTracking() {
+        console.log('▶ startLocationTracking()');
+        if (!navigator.geolocation) {
+            updateStatus('Geolocation not supported');
+            return;
+        }
+        isTracking = true;
+        watchId = navigator.geolocation.watchPosition(
+            pos => { console.log('↺ watchPosition update');
+                     const sm = applySmoothingFilter({
+                         latitude: pos.coords.latitude,
+                         longitude: pos.coords.longitude,
+                         accuracy: pos.coords.accuracy
+                     });
+                     updateCoordinatesDisplay(sm);
+                     updateAccuracyDisplay(sm);
+                     analyzeMovementState(sm);
+                     if (isConfirmedMovement(sm)) handleConfirmedMovement(sm);
+                     else updateMapMarker([sm.latitude, sm.longitude]);
+                   },
+            err => { console.error('✖ watchPosition error', err);
+                     updateStatus('Tracking error: '+err.message);
+                     stopLocationTracking(); },
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
+        );
+        updateStatus('Tracking active');
+        document.getElementById('btnStart').disabled = true;
+        document.getElementById('btnStop').disabled = false;
+    }
+
+    // Stop tracking
+    function stopLocationTracking() {
+        console.log('▶ stopLocationTracking()');
+        isTracking = false;
+        if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+        }
+        updateStatus('Tracking stopped');
+        document.getElementById('btnStart').disabled = false;
+        document.getElementById('btnStop').disabled = true;
+    }
+
+    // Reset
+    function resetTracking() {
+        console.log('▶ resetTracking()');
+        stopLocationTracking();
+        referenceLocation = null; smoothedLocation = null; movementBuffer = [];
+        locationPath = []; pathPolyline.setLatLngs([]);
+        validMovementCount = 0; totalDistance = 0;
+        updateDistanceDisplay();
+        updateStatus('Reset complete');
+        updateMovementStateDisplay('Idle');
+        coordsEl.textContent = 'Coordinates: Not available';
+        accuracyEl.textContent = 'GPS Accuracy: -- meters';
+        accuracyEl.className = '';
+        map.setView([11.3056,76.9350],13);
+    }
+
+    // Initialize on load
+    window.addEventListener('load', initializeMap);
+</script>
+</body>
+</html>
